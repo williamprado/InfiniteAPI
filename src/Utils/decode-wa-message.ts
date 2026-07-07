@@ -36,6 +36,34 @@ import { retry, RetryExhaustedError, type RetryOptions } from './retry-utils'
  */
 const EMPTY_UINT8_ARRAY = new Uint8Array(0)
 
+const SELF_SYNC_FIX_LOG_PREFIX = '[InfiniteAPI:SELF-SYNC-FIX]'
+
+const getEncType = (stanza: BinaryNode) => {
+	if (!Array.isArray(stanza.content)) return undefined
+
+	return stanza.content.find(child => child.tag === 'enc')?.attrs?.type
+}
+
+export const isRecoverableLidSelfSyncStanza = (stanza: BinaryNode, meId: string, meLid: string) => {
+	const { from, recipient, peer_recipient_pn: peerRecipientPn } = stanza.attrs
+	const encType = getEncType(stanza)
+
+	return !!(
+		from &&
+		recipient &&
+		peerRecipientPn &&
+		isLidUser(from) &&
+		isLidUser(recipient) &&
+		isPnUser(peerRecipientPn) &&
+		areJidsSameUser(from, meId) === false &&
+		areJidsSameUser(from, meLid) &&
+		(encType === 'msg' || encType === 'pkmsg')
+	)
+}
+
+export const getSelfSyncChatJid = (stanza: BinaryNode, meId: string, meLid: string) =>
+	isRecoverableLidSelfSyncStanza(stanza, meId, meLid) ? stanza.attrs.peer_recipient_pn : undefined
+
 /**
  * Unwrap a `deviceSentMessage` envelope while preserving fields from the OUTER
  * `Message` that the inner payload would otherwise lose. WhatsApp ships some
@@ -331,7 +359,7 @@ export const extractAddressingContext = (stanza: BinaryNode) => {
  * Decode the received node as a message.
  * @note this will only parse the message, not decrypt it
  */
-export function decodeMessageNode(stanza: BinaryNode, meId: string, meLid: string) {
+export function decodeMessageNode(stanza: BinaryNode, meId: string, meLid: string, logger?: ILogger) {
 	let msgType: MessageType
 	let chatId: string
 	let author: string
@@ -354,6 +382,7 @@ export function decodeMessageNode(stanza: BinaryNode, meId: string, meLid: strin
 
 	const isMe = (jid: string) => areJidsSameUser(jid, meId)
 	const isMeLid = (jid: string) => areJidsSameUser(jid, meLid)
+	const selfSyncChatJid = getSelfSyncChatJid(stanza, meId, meLid)
 
 	if (isPnUser(from) || isLidUser(from) || isHostedLidUser(from) || isHostedPnUser(from)) {
 		if (recipient && !isJidMetaAI(recipient)) {
@@ -365,7 +394,23 @@ export function decodeMessageNode(stanza: BinaryNode, meId: string, meLid: strin
 				fromMe = true
 			}
 
-			chatId = recipient
+			if (selfSyncChatJid) {
+				chatId = selfSyncChatJid
+				logger?.info(
+					{
+						id: msgId,
+						from,
+						recipient,
+						peerRecipientPn: stanza.attrs.peer_recipient_pn,
+						encType: getEncType(stanza),
+						fromMe,
+						chatId
+					},
+					`${SELF_SYNC_FIX_LOG_PREFIX} self_sync_detected`
+				)
+			} else {
+				chatId = recipient
+			}
 		} else {
 			// Peer-routed self stanzas (history sync, app-state sync, LID
 			// migration, PDO responses) arrive com `from === me` mas SEM
@@ -480,7 +525,7 @@ export const decryptMessageNode = (
 	 */
 	msmsgCache?: MsmsgSecretCache
 ) => {
-	const { fullMessage, author, sender } = decodeMessageNode(stanza, meId, meLid)
+	const { fullMessage, author, sender } = decodeMessageNode(stanza, meId, meLid, logger)
 
 	// Pre-scan for msmsg metadata children (<meta target_id>, <bot edit>, etc.).
 	// extractMsmsgStanzaInfo returns null unless an enc child with type=msmsg
