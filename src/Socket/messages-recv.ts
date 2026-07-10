@@ -119,6 +119,37 @@ const ENFORCEMENT_TYPE_VALUES = new Set<string>(Object.values(ReachoutTimelockEn
 const isValidEnforcementType = (value: string | undefined): value is ReachoutTimelockEnforcementType =>
 	value !== undefined && ENFORCEMENT_TYPE_VALUES.has(value)
 
+const SELF_SYNC_FIX_LOG_PREFIX = '[InfiniteAPI:SELF-SYNC-FIX]'
+
+export const resolveSenderReceiptParticipant = (
+	type: MessageReceiptType,
+	key: WAMessageKey,
+	author: string | undefined
+) => {
+	if (type === 'sender' && key.fromMe && !key.participant && author) {
+		return author
+	}
+
+	return key.participant
+}
+
+export const isSelfSyncReceiptFailureNonFatal = (
+	type: MessageReceiptType,
+	key: WAMessageKey,
+	author: string | undefined,
+	node: BinaryNode
+) =>
+	type === 'sender' &&
+	!!key.fromMe &&
+	!!key.id &&
+	!!author &&
+		(!!node.attrs.peer_recipient_pn ||
+			isLidUser(node.attrs.from) ||
+			isLidUser(node.attrs.recipient) ||
+			isLidUser(key.remoteJid ?? undefined) ||
+			isLidUser(key.remoteJidAlt ?? undefined) ||
+			isLidUser(author))
+
 export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	const {
 		logger,
@@ -3435,11 +3466,46 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 							if (isLidUser(msg.key.remoteJid!) || isLidUser(msg.key.remoteJidAlt)) {
 								participant = author // TODO: investigate sending receipts to LIDs and not PNs
 							}
+							const resolvedParticipant = resolveSenderReceiptParticipant(type, msg.key, author)
+							if (!participant && resolvedParticipant) {
+								participant = resolvedParticipant
+								logger.info(
+									{
+										id: msg.key.id,
+										remoteJid: msg.key.remoteJid,
+										remoteJidAlt: msg.key.remoteJidAlt,
+										fromMe: msg.key.fromMe,
+										participant,
+										author
+									},
+									`${SELF_SYNC_FIX_LOG_PREFIX} sender_receipt_participant_from_author`
+								)
+							}
 						} else if (!sendActiveReceipts) {
 							type = 'inactive'
 						}
 
-						await sendReceipt(msg.key.remoteJid!, participant!, [msg.key.id!], type)
+						try {
+							await sendReceipt(msg.key.remoteJid!, participant!, [msg.key.id!], type)
+						} catch (err) {
+							if (!isSelfSyncReceiptFailureNonFatal(type, msg.key, author, node)) {
+								throw err
+							}
+
+							logger.warn(
+								{
+									err: compactError(err),
+									id: msg.key.id,
+									remoteJid: msg.key.remoteJid,
+									remoteJidAlt: msg.key.remoteJidAlt,
+									fromMe: msg.key.fromMe,
+									participant,
+									author,
+									type
+								},
+								`${SELF_SYNC_FIX_LOG_PREFIX} send_receipt_failed_non_fatal`
+							)
+						}
 						acked = true
 
 						// send ack for history message
@@ -3460,6 +3526,22 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				cleanMessage(msg, authState.creds.me!.id, authState.creds.me!.lid!)
 
 				await upsertMessage(msg, node.attrs.offline ? 'append' : 'notify')
+
+				if (
+					msg.key.fromMe &&
+					msg.key.id &&
+					(node.attrs.peer_recipient_pn || isLidUser(node.attrs.from) || isLidUser(node.attrs.recipient))
+				) {
+					logger.info(
+						{
+							id: msg.key.id,
+							remoteJid: msg.key.remoteJid,
+							remoteJidAlt: msg.key.remoteJidAlt,
+							fromMe: msg.key.fromMe
+						},
+						`${SELF_SYNC_FIX_LOG_PREFIX} upsert_after_self_sync`
+					)
+				}
 
 				// Log with [BAILEYS] prefix
 				if (msg.key.id && msg.key.remoteJid) {
